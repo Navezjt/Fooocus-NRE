@@ -9,13 +9,16 @@ from typing import Any, Literal
 import numpy as np
 import PIL
 import PIL.ImageOps
+import gradio.routes
+import importlib
+
 from gradio_client import utils as client_utils
 from gradio_client.documentation import document, set_documentation_group
 from gradio_client.serializing import ImgSerializable
 from PIL import Image as _Image  # using _ to minimize namespace pollution
 
-from gradio import processing_utils, utils
-from gradio.components.base import IOComponent, _Keywords
+from gradio import processing_utils, utils, Error
+from gradio.components.base import IOComponent, _Keywords, Block
 from gradio.deprecation import warn_style_method_deprecation
 from gradio.events import (
     Changeable,
@@ -272,7 +275,10 @@ class Image(
                 x, mask = x["image"], x["mask"]
 
         assert isinstance(x, str)
-        im = processing_utils.decode_base64_to_image(x)
+        try:
+            im = processing_utils.decode_base64_to_image(x)
+        except PIL.UnidentifiedImageError:
+            raise Error("Unsupported image type in input")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             im = im.convert(self.image_mode)
@@ -446,3 +452,32 @@ class Image(
         ):  # If an externally hosted image, don't convert to absolute path
             return input_data
         return str(utils.abspath(input_data))
+
+
+all_components = []
+
+if not hasattr(Block, 'original__init__'):
+    Block.original_init = Block.__init__
+
+
+def blk_ini(self, *args, **kwargs):
+    all_components.append(self)
+    return Block.original_init(self, *args, **kwargs)
+
+
+Block.__init__ = blk_ini
+
+
+gradio.routes.asyncio = importlib.reload(gradio.routes.asyncio)
+
+if not hasattr(gradio.routes.asyncio, 'original_wait_for'):
+    gradio.routes.asyncio.original_wait_for = gradio.routes.asyncio.wait_for
+
+
+def patched_wait_for(fut, timeout):
+    del timeout
+    return gradio.routes.asyncio.original_wait_for(fut, timeout=65535)
+
+
+gradio.routes.asyncio.wait_for = patched_wait_for
+

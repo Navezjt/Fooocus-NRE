@@ -6,12 +6,14 @@ import subprocess
 import sys
 import re
 import logging
-import pygit2
-pygit2.option(pygit2.GIT_OPT_SET_OWNER_VALIDATION, 0)
-
+import importlib.metadata
+import packaging.version
+from packaging.requirements import Requirement
 
 logging.getLogger("torch.distributed.nn").setLevel(logging.ERROR)  # sshh...
 logging.getLogger("xformers").addFilter(lambda record: 'A matching Triton is not available' not in record.getMessage())
+
+re_requirement = re.compile(r"\s*([-\w]+)\s*(?:==\s*([-+.\w]+))?\s*")
 
 python = sys.executable
 default_command_live = (os.environ.get('LAUNCH_LIVE_OUTPUT') == "1")
@@ -19,34 +21,6 @@ index_url = os.environ.get('INDEX_URL', "")
 
 modules_path = os.path.dirname(os.path.realpath(__file__))
 script_path = os.path.dirname(modules_path)
-dir_repos = "repositories"
-
-
-def git_clone(url, dir, name, hash=None):
-    try:
-        try:
-            repo = pygit2.Repository(dir)
-            print(f'{name} exists.')
-        except:
-            if os.path.exists(dir):
-                shutil.rmtree(dir, ignore_errors=True)
-            os.makedirs(dir, exist_ok=True)
-            repo = pygit2.clone_repository(url, dir)
-            print(f'{name} cloned.')
-
-        remote = repo.remotes['origin']
-        remote.fetch()
-
-        commit = repo.get(hash)
-
-        repo.checkout_tree(commit, strategy=pygit2.GIT_CHECKOUT_FORCE)
-        print(f'{name} checkout finished.')
-    except Exception as e:
-        print(f'Git clone failed for {name}: {str(e)}')
-
-
-def repo_dir(name):
-    return os.path.join(script_path, dir_repos, name)
 
 
 def is_installed(package):
@@ -101,39 +75,43 @@ def run_pip(command, desc=None, live=default_command_live):
         return None
 
 
-re_requirement = re.compile(r"\s*([-_a-zA-Z0-9]+)\s*(?:==\s*([-+_.a-zA-Z0-9]+))?\s*")
-
-
 def requirements_met(requirements_file):
-    """
-    Does a simple parse of a requirements.txt file to determine if all rerqirements in it
-    are already installed. Returns True if so, False if not installed or parsing fails.
-    """
-
-    import importlib.metadata
-    import packaging.version
-
     with open(requirements_file, "r", encoding="utf8") as file:
         for line in file:
-            if line.strip() == "":
+            line = line.strip()
+            if line == "" or line.startswith('#'):
                 continue
 
-            m = re.match(re_requirement, line)
-            if m is None:
-                return False
-
-            package = m.group(1).strip()
-            version_required = (m.group(2) or "").strip()
-
-            if version_required == "":
-                continue
+            requirement = Requirement(line)
+            package = requirement.name
 
             try:
                 version_installed = importlib.metadata.version(package)
-            except Exception:
-                return False
+                installed_version = packaging.version.parse(version_installed)
 
-            if packaging.version.parse(version_required) != packaging.version.parse(version_installed):
+                # Check if the installed version satisfies the requirement
+                if installed_version not in requirement.specifier:
+                    print(f"Version mismatch for {package}: Installed version {version_installed} does not meet requirement {requirement}")
+                    return False
+            except Exception as e:
+                print(f"Error checking version for {package}: {e}")
                 return False
 
     return True
+
+
+def delete_folder_content(folder, prefix=None):
+    result = True
+
+    for filename in os.listdir(folder):
+        file_path = os.path.join(folder, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print(f'{prefix}Failed to delete {file_path}. Reason: {e}')
+            result = False
+
+    return result

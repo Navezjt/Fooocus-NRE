@@ -1,26 +1,14 @@
 import os
-import json
 import re
-import random
+import json
+import math
+import modules.config
 
-from os.path import exists
-from modules.path import styles_path, wildcards_path, get_files_from_folder
-from modules.util import join_prompts
+from modules.util import get_files_from_folder
 
-
-fooocus_expansion = "Prompt Expansion (Fooocus V2)"
-
-
-base_styles = [
-    {
-        "name": "Default (Slightly Cinematic)",
-        "prompt": "cinematic still {prompt} . emotional, harmonious, vignette, highly detailed, high budget, bokeh, cinemascope, moody, epic, gorgeous, film grain, grainy",
-        "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"
-    }
-]
-
-
-default_styles_files = ['sdxl_styles_sai.json', 'sdxl_styles_twri.json', 'sdxl_styles_diva.json', 'sdxl_styles_mre.json']
+# cannot use modules.config - validators causing circular imports
+styles_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../sdxl_styles/'))
+wildcards_max_bfs_depth = 64
 
 
 def normalize_key(k):
@@ -35,70 +23,99 @@ def normalize_key(k):
     return k
 
 
-def migrate_style_from_v1(style):
-    if style == 'cinematic-default':
-        return ['Default (Slightly Cinematic)']
-    elif style == 'None':
-        return []
-    else:
-        return [normalize_key(style)]
+styles = {}
 
+styles_files = get_files_from_folder(styles_path, ['.json'])
 
-def styles_list_to_styles_dict(styles_list=None, base_dict=None):
-    styles_dict = {} if base_dict == None else base_dict
-    if isinstance(styles_list, list) and len(styles_list) > 0:
-        for entry in styles_list:
-            name, prompt, negative_prompt = normalize_key(entry['name']), entry['prompt'], entry['negative_prompt']
-            if name not in styles_dict:
-                styles_dict |=  {name: (prompt, negative_prompt)}
-    return styles_dict
+for x in ['sdxl_styles_fooocus.json',
+          'sdxl_styles_sai.json',
+          'sdxl_styles_mre.json',
+          'sdxl_styles_twri.json',
+          'sdxl_styles_diva.json',
+          'sdxl_styles_marc_k3nt3l.json']:
+    if x in styles_files:
+        styles_files.remove(x)
+        styles_files.append(x)
 
-
-def load_styles(filename=None, base_dict=None):
-    styles_dict = {} if base_dict == None else base_dict
-    full_path = os.path.join(styles_path, filename) if filename != None else None
-    if full_path != None and exists(full_path):
-        with open(full_path, encoding='utf-8') as styles_file:
-            try:
-                styles_obj = json.load(styles_file)
-                styles_list_to_styles_dict(styles_obj, styles_dict)
-            except Exception as e:
-                print('load_styles, e: ' + str(e))
-            finally:
-                styles_file.close()
-    return styles_dict
-
-
-styles = styles_list_to_styles_dict(base_styles)
-for styles_file in default_styles_files:
-    styles = load_styles(styles_file, styles)
-
-
-all_styles_files = get_files_from_folder(styles_path, ['.json'])
-for styles_file in all_styles_files:
-    if styles_file not in default_styles_files:
-        styles = load_styles(styles_file, styles)
-
+for styles_file in styles_files:
+    try:
+        with open(os.path.join(styles_path, styles_file), encoding='utf-8') as f:
+            for entry in json.load(f):
+                name = normalize_key(entry['name'])
+                prompt = entry['prompt'] if 'prompt' in entry else ''
+                negative_prompt = entry['negative_prompt'] if 'negative_prompt' in entry else ''
+                styles[name] = (prompt, negative_prompt)
+    except Exception as e:
+        print(str(e))
+        print(f'Failed to load style file {styles_file}')
 
 style_keys = list(styles.keys())
+fooocus_expansion = "Fooocus V2"
+legal_style_names = [fooocus_expansion] + style_keys
 
 
 def apply_style(style, positive):
     p, n = styles[style]
-    return p.replace('{prompt}', positive), n
+    return p.replace('{prompt}', positive).splitlines(), n.splitlines()
 
 
+def apply_wildcards(wildcard_text, rng, i, read_wildcards_in_order):
+    for _ in range(wildcards_max_bfs_depth):
+        placeholders = re.findall(r'__([\w-]+)__', wildcard_text)
+        if len(placeholders) == 0:
+            return wildcard_text
 
-def apply_wildcards(wildcard_text, seed=None, directory=wildcards_path):
-    placeholders = re.findall(r'__(\w+)__', wildcard_text)
-    for placeholder in placeholders:
-        try:
-            with open(os.path.join(directory, f'{placeholder}.txt')) as f:
-                words = f.read().splitlines()
-                f.close()
-                rng = random.Random(seed)
-                wildcard_text = re.sub(rf'__{placeholder}__', rng.choice(words), wildcard_text)
-        except IOError:
-            print(f'Error: could not open wildcard file {placeholder}.txt, using as normal word.')
-            wildcard_text = wildcard_text.replace(f'__{placeholder}__', placeholder)
+        print(f'[Wildcards] processing: {wildcard_text}')
+        for placeholder in placeholders:
+            try:
+                matches = [x for x in modules.config.wildcard_filenames if os.path.splitext(os.path.basename(x))[0] == placeholder]
+                words = open(os.path.join(modules.config.path_wildcards, matches[0]), encoding='utf-8').read().splitlines()
+                words = [x for x in words if x != '']
+                assert len(words) > 0
+                if read_wildcards_in_order:
+                    wildcard_text = wildcard_text.replace(f'__{placeholder}__', words[i % len(words)], 1)
+                else:
+                    wildcard_text = wildcard_text.replace(f'__{placeholder}__', rng.choice(words), 1)
+            except:
+                print(f'[Wildcards] Warning: {placeholder}.txt missing or empty. '
+                      f'Using "{placeholder}" as a normal word.')
+                wildcard_text = wildcard_text.replace(f'__{placeholder}__', placeholder)
+            print(f'[Wildcards] {wildcard_text}')
+
+    print(f'[Wildcards] BFS stack overflow. Current text: {wildcard_text}')
     return wildcard_text
+
+
+def get_words(arrays, totalMult, index):
+    if len(arrays) == 1:
+        return [arrays[0].split(',')[index]]
+    else:
+        words = arrays[0].split(',')
+        word = words[index % len(words)]
+        index -= index % len(words)
+        index /= len(words)
+        index = math.floor(index)
+        return [word] + get_words(arrays[1:], math.floor(totalMult/len(words)), index)
+
+
+def apply_arrays(text, index):
+    arrays = re.findall(r'\[\[(.*?)\]\]', text)
+    if len(arrays) == 0:
+        return text
+
+    print(f'[Arrays] processing: {text}')
+    mult = 1
+    for arr in arrays:
+        words = arr.split(',')
+        mult *= len(words)
+    
+    index %= mult
+    chosen_words = get_words(arrays, mult, index)
+    
+    i = 0
+    for arr in arrays:
+        text = text.replace(f'[[{arr}]]', chosen_words[i], 1)   
+        i = i+1
+    
+    return text
+
