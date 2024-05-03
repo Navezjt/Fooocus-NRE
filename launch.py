@@ -1,53 +1,57 @@
 import os
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
+import ssl
 import sys
+
+print('[System ARGV] ' + str(sys.argv))
+
+root = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(root)
+os.chdir(root)
+
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+if "GRADIO_SERVER_PORT" not in os.environ:
+    os.environ["GRADIO_SERVER_PORT"] = "7865"
+
+ssl._create_default_https_context = ssl._create_unverified_context
+
 import platform
 import fooocus_version
-import argparse
 
-from modules.launch_util import is_installed, run, python, \
-    run_pip, repo_dir, git_clone, requirements_met, script_path, dir_repos
+from build_launcher import build_launcher
+from modules.launch_util import is_installed, run, python, run_pip, requirements_met, delete_folder_content
 from modules.model_loader import load_file_from_url
-from modules.path import modelfile_path, lorafile_path, clip_vision_path, controlnet_path, vae_approx_path, fooocus_expansion_path, upscale_models_path
-
 
 REINSTALL_ALL = False
-DEFAULT_ARGS = ['--disable-smart-memory', '--disable-cuda-malloc']
+TRY_INSTALL_XFORMERS = False
+
 
 def prepare_environment():
-    torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu118")
+    torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://download.pytorch.org/whl/cu121")
     torch_command = os.environ.get('TORCH_COMMAND',
-                                   f"pip install torch==2.0.1 torchvision==0.15.2 --extra-index-url {torch_index_url}")
+                                   f"pip install torch==2.1.0 torchvision==0.16.0 --extra-index-url {torch_index_url}")
     requirements_file = os.environ.get('REQS_FILE', "requirements_versions.txt")
-
-    xformers_package = os.environ.get('XFORMERS_PACKAGE', 'xformers==0.0.21')
-
-    comfy_repo = os.environ.get('COMFY_REPO', "https://github.com/comfyanonymous/ComfyUI")
-    comfy_commit_hash = os.environ.get('COMFY_COMMIT_HASH', "2381d36e6db8e8150e42ff2ede628db5b00ae26f")
 
     print(f"Python {sys.version}")
     print(f"Fooocus version: {fooocus_version.version}")
 
-    comfyui_name = 'ComfyUI-from-StabilityAI-Official'
-    git_clone(comfy_repo, repo_dir(comfyui_name), "Inference Engine", comfy_commit_hash)
-    sys.path.append(os.path.join(script_path, dir_repos, comfyui_name))
-
     if REINSTALL_ALL or not is_installed("torch") or not is_installed("torchvision"):
         run(f'"{python}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
 
-    if REINSTALL_ALL or not is_installed("xformers"):
-        if platform.system() == "Windows":
-            if platform.python_version().startswith("3.10"):
-                run_pip(f"install -U -I --no-deps {xformers_package}", "xformers", live=True)
-            else:
-                print("Installation of xformers is not supported in this version of Python.")
-                print(
-                    "You can also check this and build manually: https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Xformers#building-xformers-on-windows-by-duckness")
-                if not is_installed("xformers"):
-                    exit(0)
-        elif platform.system() == "Linux":
-            run_pip(f"install -U -I --no-deps {xformers_package}", "xformers")
+    if TRY_INSTALL_XFORMERS:
+        if REINSTALL_ALL or not is_installed("xformers"):
+            xformers_package = os.environ.get('XFORMERS_PACKAGE', 'xformers==0.0.23')
+            if platform.system() == "Windows":
+                if platform.python_version().startswith("3.10"):
+                    run_pip(f"install -U -I --no-deps {xformers_package}", "xformers", live=True)
+                else:
+                    print("Installation of xformers is not supported in this version of Python.")
+                    print(
+                        "You can also check this and build manually: https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Xformers#building-xformers-on-windows-by-duckness")
+                    if not is_installed("xformers"):
+                        exit(0)
+            elif platform.system() == "Linux":
+                run_pip(f"install -U -I --no-deps {xformers_package}", "xformers")
 
     if REINSTALL_ALL or not requirements_met(requirements_file):
         run_pip(f"install -r \"{requirements_file}\"", "requirements")
@@ -55,93 +59,78 @@ def prepare_environment():
     return
 
 
-model_filenames = [
-    ('sd_xl_base_1.0_0.9vae.safetensors',
-     'https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0_0.9vae.safetensors'),
-    ('sd_xl_refiner_1.0_0.9vae.safetensors',
-     'https://huggingface.co/stabilityai/stable-diffusion-xl-refiner-1.0/resolve/main/sd_xl_refiner_1.0_0.9vae.safetensors')
-]
-
-lora_filenames = [
-    ('sd_xl_offset_example-lora_1.0.safetensors',
-     'https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_offset_example-lora_1.0.safetensors')
-]
-
-clip_vision_filenames = [
-    ('clip_vision_g.safetensors',
-     'https://huggingface.co/stabilityai/control-lora/resolve/main/revision/clip_vision_g.safetensors')
-]
-
-controlnet_filenames = [
-    ('control-lora-canny-rank128.safetensors',
-     'https://huggingface.co/stabilityai/control-lora/resolve/main/control-LoRAs-rank128/control-lora-canny-rank128.safetensors'),
-    ('control-lora-canny-rank256.safetensors',
-     'https://huggingface.co/stabilityai/control-lora/resolve/main/control-LoRAs-rank256/control-lora-canny-rank256.safetensors'),
-    ('control-lora-depth-rank128.safetensors',
-     'https://huggingface.co/stabilityai/control-lora/resolve/main/control-LoRAs-rank128/control-lora-depth-rank128.safetensors'),
-    ('control-lora-depth-rank256.safetensors',
-     'https://huggingface.co/stabilityai/control-lora/resolve/main/control-LoRAs-rank256/control-lora-depth-rank256.safetensors')
-]
-
 vae_approx_filenames = [
-    ('xlvaeapp.pth',
-     'https://huggingface.co/lllyasviel/misc/resolve/main/xlvaeapp.pth'),
-    ('taesd_decoder.pth',
-     'https://github.com/madebyollin/taesd/raw/main/taesd_decoder.pth')
+    ('xlvaeapp.pth', 'https://huggingface.co/lllyasviel/misc/resolve/main/xlvaeapp.pth'),
+    ('vaeapp_sd15.pth', 'https://huggingface.co/lllyasviel/misc/resolve/main/vaeapp_sd15.pt'),
+    ('xl-to-v1_interposer-v3.1.safetensors',
+     'https://huggingface.co/lllyasviel/misc/resolve/main/xl-to-v1_interposer-v3.1.safetensors')
 ]
 
 
-upscaler_filenames = [
-    ('fooocus_upscaler_s409985e5.bin',
-     'https://huggingface.co/lllyasviel/misc/resolve/main/fooocus_upscaler_s409985e5.bin')
-]
-
-
-def download_models():
-    for file_name, url in model_filenames:
-        load_file_from_url(url=url, model_dir=modelfile_path, file_name=file_name)
-    for file_name, url in lora_filenames:
-        load_file_from_url(url=url, model_dir=lorafile_path, file_name=file_name)
-    for file_name, url in clip_vision_filenames:
-        load_file_from_url(url=url, model_dir=clip_vision_path, file_name=file_name)
-    for file_name, url in controlnet_filenames:
-        load_file_from_url(url=url, model_dir=controlnet_path, file_name=file_name)
-    for file_name, url in vae_approx_filenames:
-        load_file_from_url(url=url, model_dir=vae_approx_path, file_name=file_name)
-    for file_name, url in upscaler_filenames:
-        load_file_from_url(url=url, model_dir=upscale_models_path, file_name=file_name)
-
-    load_file_from_url(
-        url='https://huggingface.co/lllyasviel/misc/resolve/main/fooocus_expansion.bin',
-        model_dir=fooocus_expansion_path,
-        file_name='pytorch_model.bin'
-    )
-
-    return
-
-
-def parse_args():
-    argv = sys.argv + DEFAULT_ARGS
-    sys.argv = [sys.argv[0]]
-    import comfy.cli_args
-    sys.argv = argv
-
-    parser = argparse.ArgumentParser('launch.py', parents=[comfy.cli_args.parser], conflict_handler='resolve')
-    parser.add_argument("--port", type=int, default=None, help="Set the listen port.")
-    parser.add_argument("--share", action='store_true', help="Set whether to share on Gradio.")
-    parser.add_argument("--listen", type=str, default=None, metavar="IP", nargs="?", const="0.0.0.0", help="Set the listen interface.")
-
-    comfy.cli_args.args = parser.parse_args()
-
-
-def cuda_malloc():
-    import cuda_malloc
+def ini_args():
+    from args_manager import args
+    return args
 
 
 prepare_environment()
+build_launcher()
+args = ini_args()
 
-parse_args()
+if args.gpu_device_id is not None:
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_device_id)
+    print("Set device to:", args.gpu_device_id)
 
-download_models()
+from modules import config
+
+os.environ['GRADIO_TEMP_DIR'] = config.temp_path
+
+if config.temp_path_cleanup_on_launch:
+    print(f'[Cleanup] Attempting to delete content of temp dir {config.temp_path}')
+    result = delete_folder_content(config.temp_path, '[Cleanup] ')
+    if result:
+        print("[Cleanup] Cleanup successful")
+    else:
+        print(f"[Cleanup] Failed to delete content of temp dir.")
+
+
+def download_models(default_model, previous_default_models, checkpoint_downloads, embeddings_downloads, lora_downloads):
+    for file_name, url in vae_approx_filenames:
+        load_file_from_url(url=url, model_dir=config.path_vae_approx, file_name=file_name)
+
+    load_file_from_url(
+        url='https://huggingface.co/lllyasviel/misc/resolve/main/fooocus_expansion.bin',
+        model_dir=config.path_fooocus_expansion,
+        file_name='pytorch_model.bin'
+    )
+
+    if args.disable_preset_download:
+        print('Skipped model download.')
+        return default_model, checkpoint_downloads
+
+    if not args.always_download_new_model:
+        if not os.path.exists(os.path.join(config.paths_checkpoints[0], default_model)):
+            for alternative_model_name in previous_default_models:
+                if os.path.exists(os.path.join(config.paths_checkpoints[0], alternative_model_name)):
+                    print(f'You do not have [{default_model}] but you have [{alternative_model_name}].')
+                    print(f'Fooocus will use [{alternative_model_name}] to avoid downloading new models, '
+                          f'but you are not using the latest models.')
+                    print('Use --always-download-new-model to avoid fallback and always get new models.')
+                    checkpoint_downloads = {}
+                    default_model = alternative_model_name
+                    break
+
+    for file_name, url in checkpoint_downloads.items():
+        load_file_from_url(url=url, model_dir=config.paths_checkpoints[0], file_name=file_name)
+    for file_name, url in embeddings_downloads.items():
+        load_file_from_url(url=url, model_dir=config.path_embeddings, file_name=file_name)
+    for file_name, url in lora_downloads.items():
+        load_file_from_url(url=url, model_dir=config.paths_loras[0], file_name=file_name)
+
+    return default_model, checkpoint_downloads
+
+
+config.default_base_model_name, config.checkpoint_downloads = download_models(
+    config.default_base_model_name, config.previous_default_models, config.checkpoint_downloads,
+    config.embeddings_downloads, config.lora_downloads)
 
 from webui import *
