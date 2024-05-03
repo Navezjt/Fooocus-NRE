@@ -1,6 +1,5 @@
 import json
 import hashlib
-import modules.constants as constants
 
 from os.path import exists
 
@@ -26,10 +25,12 @@ def load_auth_data(filename=None):
                     auth_dict = auth_list_to_dict(auth_obj)
             except Exception as e:
                 print('load_auth_data, e: ' + str(e))
+            finally:
+                auth_file.close()
     return auth_dict
 
 
-auth_dict = load_auth_data(constants.AUTH_FILENAME)
+auth_dict = load_auth_data('auth.json')
 
 auth_enabled = auth_dict != None
 
