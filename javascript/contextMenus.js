@@ -130,6 +130,10 @@ var appendContextMenuOption = initResponse[0];
 var removeContextMenuOption = initResponse[1];
 var addContextMenuEventListener = initResponse[2];
 
+let cancelGenerateForever = function() {
+    clearInterval(window.generateOnRepeatInterval);
+};
+
 (function() {
     //Start example Context Menu Items
     let generateOnRepeat = function(genbuttonid, interruptbuttonid) {
@@ -150,16 +154,7 @@ var addContextMenuEventListener = initResponse[2];
     let generateOnRepeatForButtons = function() {
         generateOnRepeat('#generate_button', '#stop_button');
     };
-
     appendContextMenuOption('#generate_button', 'Generate forever', generateOnRepeatForButtons);
-    appendContextMenuOption('#stop_button', 'Generate forever', generateOnRepeatForButtons);
-
-    let cancelGenerateForever = function() {
-        clearInterval(window.generateOnRepeatInterval);
-    };
-
-    appendContextMenuOption('#stop_button', 'Cancel generate forever', cancelGenerateForever);
-    appendContextMenuOption('#generate_button', 'Cancel generate forever', cancelGenerateForever);
 
 })();
 //End example Context Menu Items
