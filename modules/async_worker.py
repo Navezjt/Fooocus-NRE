@@ -1,30 +1,16 @@
 import threading
-import re
-from modules.patch import PatchSettings, patch_settings, patch_all
-
-patch_all()
 
 
-class AsyncTask:
-    def __init__(self, args):
-        self.args = args
-        self.yields = []
-        self.results = []
-        self.last_stop = False
-        self.processing = False
-
-
-async_tasks = []
+buffer = []
+outputs = []
 
 
 def worker():
-    global async_tasks
+    global buffer, outputs
 
     import os
-    import traceback
-    import math
+    import json
     import numpy as np
-    import cv2
     import torch
     import time
     import shared
@@ -33,30 +19,22 @@ def worker():
     import modules.default_pipeline as pipeline
     import modules.core as core
     import modules.flags as flags
-    import modules.config
+    import modules.path
     import modules.patch
-    import ldm_patched.modules.model_management
-    import extras.preprocessors as preprocessors
+    import fooocus_version
+    import modules.virtual_memory as virtual_memory
+    import comfy.model_management
     import modules.inpaint_worker as inpaint_worker
     import modules.constants as constants
-    import extras.ip_adapter as ip_adapter
-    import extras.face_crop
-    import fooocus_version
-    import args_manager
 
-    from extras.censor import default_censor
-    from modules.sdxl_styles import apply_style, get_random_style, fooocus_expansion, apply_arrays, random_style_name
+    from PIL import Image, ImageOps
+    from modules.settings import default_settings
+    from modules.resolutions import annotate_resolution_string, get_resolution_string, resolutions, string_to_dimensions
+    from modules.sdxl_styles import apply_style, apply_wildcards, style_keys
     from modules.private_logger import log
-    from extras.expansion import safe_str
-    from modules.util import (remove_empty_str, HWC3, resize_image, get_image_shape_ceil, set_image_shape_ceil,
-                              get_shape_ceil, resample_image, erode_or_dilate, get_enabled_loras,
-                              parse_lora_references_from_prompt, apply_wildcards)
+    from modules.expansion import safe_str
+    from modules.util import join_prompts, remove_empty_str, HWC3, resize_image, image_is_generated_in_current_ui
     from modules.upscaler import perform_upscale
-    from modules.flags import Performance
-    from modules.meta_parser import get_metadata_parser, MetadataScheme
-
-    pid = os.getpid()
-    print(f'Started worker with PID {pid}')
 
     try:
         async_gradio_app = shared.gradio_root
@@ -67,926 +45,572 @@ def worker():
     except Exception as e:
         print(e)
 
-    def progressbar(async_task, number, text):
+
+    def get_image(path, megapixels=1.0):
+        image = None
+        with open(path, 'rb') as image_file:
+            pil_image = Image.open(image_file)
+            image = ImageOps.exif_transpose(pil_image)
+            image_file.close()
+            image = image.convert("RGB")
+            image = np.array(image).astype(np.float32) / 255.0
+            image = torch.from_numpy(image)[None,]
+            image = core.upscale(image, megapixels)
+        return image
+
+
+    def progressbar(number, text):
         print(f'[Fooocus] {text}')
-        async_task.yields.append(['preview', (number, text, None)])
+        outputs.append(['preview', (number, text, None)])
 
-    def yield_result(async_task, imgs, black_out_nsfw, censor=True, do_not_show_finished_images=False,
-                     progressbar_index=flags.preparation_step_count):
-        if not isinstance(imgs, list):
-            imgs = [imgs]
-
-        if censor and (modules.config.default_black_out_nsfw or black_out_nsfw):
-            progressbar(async_task, progressbar_index, 'Checking for NSFW content ...')
-            imgs = default_censor(imgs)
-
-        async_task.results = async_task.results + imgs
-
-        if do_not_show_finished_images:
-            return
-
-        async_task.yields.append(['results', async_task.results])
-        return
-
-    def build_image_wall(async_task):
-        results = []
-
-        if len(async_task.results) < 2:
-            return
-
-        for img in async_task.results:
-            if isinstance(img, str) and os.path.exists(img):
-                img = cv2.imread(img)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            if not isinstance(img, np.ndarray):
-                return
-            if img.ndim != 3:
-                return
-            results.append(img)
-
-        H, W, C = results[0].shape
-
-        for img in results:
-            Hn, Wn, Cn = img.shape
-            if H != Hn:
-                return
-            if W != Wn:
-                return
-            if C != Cn:
-                return
-
-        cols = float(len(results)) ** 0.5
-        cols = int(math.ceil(cols))
-        rows = float(len(results)) / float(cols)
-        rows = int(math.ceil(rows))
-
-        wall = np.zeros(shape=(H * rows, W * cols, C), dtype=np.uint8)
-
-        for y in range(rows):
-            for x in range(cols):
-                if y * cols + x < len(results):
-                    img = results[y * cols + x]
-                    wall[y * H:y * H + H, x * W:x * W + W, :] = img
-
-        # must use deep copy otherwise gradio is super laggy. Do not use list.append() .
-        async_task.results = async_task.results + [wall]
-        return
 
     @torch.no_grad()
     @torch.inference_mode()
-    def handler(async_task):
-        execution_start_time = time.perf_counter()
-        async_task.processing = True
-
-        args = async_task.args
-        args.reverse()
-
-        prompt = args.pop()
-        negative_prompt = args.pop()
-        style_selections = args.pop()
-        performance_selection = Performance(args.pop())
-        aspect_ratios_selection = args.pop()
-        image_number = args.pop()
-        output_format = args.pop()
-        image_seed = args.pop()
-        read_wildcards_in_order = args.pop()
-        sharpness = args.pop()
-        guidance_scale = args.pop()
-        base_model_name = args.pop()
-        refiner_model_name = args.pop()
-        refiner_switch = args.pop()
-        loras = get_enabled_loras([(bool(args.pop()), str(args.pop()), float(args.pop())) for _ in
-                                   range(modules.config.default_max_lora_number)])
-        input_image_checkbox = args.pop()
-        current_tab = args.pop()
-        uov_method = args.pop()
-        uov_input_image = args.pop()
-        outpaint_selections = args.pop()
-        inpaint_input_image = args.pop()
-        inpaint_additional_prompt = args.pop()
-        inpaint_mask_image_upload = args.pop()
-
-        disable_preview = args.pop()
-        disable_intermediate_results = args.pop()
-        disable_seed_increment = args.pop()
-        black_out_nsfw = args.pop()
-        adm_scaler_positive = args.pop()
-        adm_scaler_negative = args.pop()
-        adm_scaler_end = args.pop()
-        adaptive_cfg = args.pop()
-        clip_skip = args.pop()
-        sampler_name = args.pop()
-        scheduler_name = args.pop()
-        vae_name = args.pop()
-        overwrite_step = args.pop()
-        overwrite_switch = args.pop()
-        overwrite_width = args.pop()
-        overwrite_height = args.pop()
-        overwrite_vary_strength = args.pop()
-        overwrite_upscale_strength = args.pop()
-        mixing_image_prompt_and_vary_upscale = args.pop()
-        mixing_image_prompt_and_inpaint = args.pop()
-        debugging_cn_preprocessor = args.pop()
-        skipping_cn_preprocessor = args.pop()
-        canny_low_threshold = args.pop()
-        canny_high_threshold = args.pop()
-        refiner_swap_method = args.pop()
-        controlnet_softness = args.pop()
-        freeu_enabled = args.pop()
-        freeu_b1 = args.pop()
-        freeu_b2 = args.pop()
-        freeu_s1 = args.pop()
-        freeu_s2 = args.pop()
-        debugging_inpaint_preprocessor = args.pop()
-        inpaint_disable_initial_latent = args.pop()
-        inpaint_engine = args.pop()
-        inpaint_strength = args.pop()
-        inpaint_respective_field = args.pop()
-        inpaint_mask_upload_checkbox = args.pop()
-        invert_mask_checkbox = args.pop()
-        inpaint_erode_or_dilate = args.pop()
-
-        save_metadata_to_images = args.pop() if not args_manager.args.disable_metadata else False
-        metadata_scheme = MetadataScheme(
-            args.pop()) if not args_manager.args.disable_metadata else MetadataScheme.FOOOCUS
-
-        cn_tasks = {x: [] for x in flags.ip_list}
-        for _ in range(flags.controlnet_image_count):
-            cn_img = args.pop()
-            cn_stop = args.pop()
-            cn_weight = args.pop()
-            cn_type = args.pop()
-            if cn_img is not None:
-                cn_tasks[cn_type].append([cn_img, cn_stop, cn_weight])
+    def handler(task):
+        prompt, negative_prompt, style_selections, performance, resolution, image_number, image_seed, \
+        sharpness, sampler_name, scheduler, custom_steps, custom_switch, cfg, \
+        base_model_name, refiner_model_name, base_clip_skip, refiner_clip_skip, \
+        l1, w1, l2, w2, l3, w3, l4, w4, l5, w5, \
+        save_metadata_json, save_metadata_image, \
+        img2img_mode, img2img_start_step, img2img_denoise, img2img_scale, \
+        revision_mode, positive_prompt_strength, negative_prompt_strength, revision_strength_1, revision_strength_2, \
+        revision_strength_3, revision_strength_4, same_seed_for_all, output_format, \
+        control_lora_canny, canny_edge_low, canny_edge_high, canny_start, canny_stop, canny_strength, canny_model, \
+        control_lora_depth, depth_start, depth_stop, depth_strength, depth_model, use_expansion, \
+        freeu, freeu_b1, freeu_b2, freeu_s1, freeu_s2, \
+        input_image_checkbox, current_tab, \
+        uov_method, uov_input_image, outpaint_selections, inpaint_input_image, \
+        use_style_iterator, input_gallery, revision_gallery, keep_input_names = task
 
         outpaint_selections = [o.lower() for o in outpaint_selections]
-        base_model_additional_loras = []
-        raw_style_selections = copy.deepcopy(style_selections)
+
+        loras = [(l1, w1), (l2, w2), (l3, w3), (l4, w4), (l5, w5)]
+        loras_user_raw_input = copy.deepcopy(loras)
+
+        if use_style_iterator:
+            style_iterator_pool = style_keys.copy()
+            for s in style_selections:
+                style_iterator_pool.remove(s)
+
         uov_method = uov_method.lower()
 
-        if fooocus_expansion in style_selections:
-            use_expansion = True
-            style_selections.remove(fooocus_expansion)
-        else:
-            use_expansion = False
-
-        use_style = len(style_selections) > 0
-
-        if base_model_name == refiner_model_name:
-            print(f'Refiner disabled because base model and refiner are same.')
-            refiner_model_name = 'None'
-
-        steps = performance_selection.steps()
-
-        performance_loras = []
-
-        if performance_selection == Performance.EXTREME_SPEED:
-            print('Enter LCM mode.')
-            progressbar(async_task, 1, 'Downloading LCM components ...')
-            performance_loras += [(modules.config.downloading_sdxl_lcm_lora(), 1.0)]
-
-            if refiner_model_name != 'None':
-                print(f'Refiner disabled in LCM mode.')
-
-            refiner_model_name = 'None'
-            sampler_name = 'lcm'
-            scheduler_name = 'lcm'
-            sharpness = 0.0
-            guidance_scale = 1.0
-            adaptive_cfg = 1.0
-            refiner_switch = 1.0
-            adm_scaler_positive = 1.0
-            adm_scaler_negative = 1.0
-            adm_scaler_end = 0.0
-
-        elif performance_selection == Performance.LIGHTNING:
-            print('Enter Lightning mode.')
-            progressbar(async_task, 1, 'Downloading Lightning components ...')
-            performance_loras += [(modules.config.downloading_sdxl_lightning_lora(), 1.0)]
-
-            if refiner_model_name != 'None':
-                print(f'Refiner disabled in Lightning mode.')
-
-            refiner_model_name = 'None'
-            sampler_name = 'euler'
-            scheduler_name = 'sgm_uniform'
-            sharpness = 0.0
-            guidance_scale = 1.0
-            adaptive_cfg = 1.0
-            refiner_switch = 1.0
-            adm_scaler_positive = 1.0
-            adm_scaler_negative = 1.0
-            adm_scaler_end = 0.0
-
-        elif performance_selection == Performance.HYPER_SD:
-            print('Enter Hyper-SD mode.')
-            progressbar(async_task, 1, 'Downloading Hyper-SD components ...')
-            performance_loras += [(modules.config.downloading_sdxl_hyper_sd_lora(), 0.8)]
-
-            if refiner_model_name != 'None':
-                print(f'Refiner disabled in Hyper-SD mode.')
-
-            refiner_model_name = 'None'
-            sampler_name = 'dpmpp_sde_gpu'
-            scheduler_name = 'karras'
-            sharpness = 0.0
-            guidance_scale = 1.0
-            adaptive_cfg = 1.0
-            refiner_switch = 1.0
-            adm_scaler_positive = 1.0
-            adm_scaler_negative = 1.0
-            adm_scaler_end = 0.0
-
-        print(f'[Parameters] Adaptive CFG = {adaptive_cfg}')
-        print(f'[Parameters] CLIP Skip = {clip_skip}')
-        print(f'[Parameters] Sharpness = {sharpness}')
-        print(f'[Parameters] ControlNet Softness = {controlnet_softness}')
-        print(f'[Parameters] ADM Scale = '
-              f'{adm_scaler_positive} : '
-              f'{adm_scaler_negative} : '
-              f'{adm_scaler_end}')
-
-        patch_settings[pid] = PatchSettings(
-            sharpness,
-            adm_scaler_end,
-            adm_scaler_positive,
-            adm_scaler_negative,
-            controlnet_softness,
-            adaptive_cfg
-        )
-
-        cfg_scale = float(guidance_scale)
-        print(f'[Parameters] CFG = {cfg_scale}')
-
+        modules.patch.sharpness = sharpness
+        modules.patch.negative_adm = True
         initial_latent = None
         denoising_strength = 1.0
         tiled = False
-
-        width, height = aspect_ratios_selection.replace('×', ' ').split(' ')[:2]
-        width, height = int(width), int(height)
-
-        skip_prompt_processing = False
-
         inpaint_worker.current_task = None
-        inpaint_parameterized = inpaint_engine != 'None'
-        inpaint_image = None
-        inpaint_mask = None
-        inpaint_head_model_path = None
 
-        use_synthetic_refiner = False
 
-        controlnet_canny_path = None
-        controlnet_cpds_path = None
-        clip_vision_path, ip_negative_path, ip_adapter_path, ip_adapter_face_path = None, None, None, None
+        if performance == 'Speed':
+            steps = constants.STEPS_SPEED
+            switch = constants.SWITCH_SPEED
+        elif performance == 'Quality':
+            steps = constants.STEPS_QUALITY
+            switch = constants.SWITCH_QUALITY
+        else:
+            steps = custom_steps
+            switch = round(custom_steps * custom_switch)
 
-        seed = int(image_seed)
-        print(f'[Parameters] Seed = {seed}')
 
-        goals = []
-        tasks = []
+        pipeline.clear_all_caches()  # save memory
+
+
+        if resolution not in resolutions:
+            try:
+                resolution = annotate_resolution_string(resolution)
+            except Exception as e:
+                print(f'Problem with resolution definition: "{resolution}", reverting to default: ' + default_settings['resolution'])
+                resolution = default_settings['resolution']
+        width, height = string_to_dimensions(resolution)
+
 
         if input_image_checkbox:
-            if (current_tab == 'uov' or (
-                    current_tab == 'ip' and mixing_image_prompt_and_vary_upscale)) \
-                    and uov_method != flags.disabled and uov_input_image is not None:
+            progressbar(0, 'Image processing ...')
+            if current_tab == 'uov' and uov_method != flags.disabled and uov_input_image is not None:
                 uov_input_image = HWC3(uov_input_image)
                 if 'vary' in uov_method:
-                    goals.append('vary')
-                elif 'upscale' in uov_method:
-                    goals.append('upscale')
-                    if 'fast' in uov_method:
-                        skip_prompt_processing = True
+                    if not image_is_generated_in_current_ui(uov_input_image, ui_width=width, ui_height=height):
+                        uov_input_image = resize_image(uov_input_image, width=width, height=height)
+                        print(f'Resolution corrected - users are uploading their own images.')
                     else:
-                        steps = performance_selection.steps_uov()
+                        print(f'Processing images generated by Fooocus.')
+                    if 'subtle' in uov_method:
+                        denoising_strength = 0.5
+                    if 'strong' in uov_method:
+                        denoising_strength = 0.85
+                    initial_pixels = core.numpy_to_pytorch(uov_input_image)
+                    progressbar(0, 'VAE encoding ...')
+                    initial_latent = core.encode_vae(vae=pipeline.xl_base_patched.vae, pixels=initial_pixels)
+                    B, C, H, W = initial_latent['samples'].shape
+                    width = W * 8
+                    height = H * 8
+                    print(f'Final resolution is {str((height, width))}.')
+                elif 'upscale' in uov_method:
+                    H, W, C = uov_input_image.shape
+                    progressbar(0, f'Upscaling image from {str((H, W))} ...')
 
-                    progressbar(async_task, 1, 'Downloading upscale models ...')
-                    modules.config.downloading_upscale_model()
-            if (current_tab == 'inpaint' or (
-                    current_tab == 'ip' and mixing_image_prompt_and_inpaint)) \
-                    and isinstance(inpaint_input_image, dict):
+                    uov_input_image = core.numpy_to_pytorch(uov_input_image)
+                    uov_input_image = perform_upscale(uov_input_image)
+                    uov_input_image = core.pytorch_to_numpy(uov_input_image)[0]
+                    print(f'Image upscaled.')
+
+                    if '1.5x' in uov_method:
+                        f = 1.5
+                    elif '2x' in uov_method:
+                        f = 2.0
+                    else:
+                        f = 1.0
+
+                    width_f = int(width * f)
+                    height_f = int(height * f)
+
+                    if image_is_generated_in_current_ui(uov_input_image, ui_width=width_f, ui_height=height_f):
+                        uov_input_image = resize_image(uov_input_image, width=int(W * f), height=int(H * f))
+                        print(f'Processing images generated by Fooocus.')
+                    else:
+                        uov_input_image = resize_image(uov_input_image, width=width_f, height=height_f)
+                        print(f'Resolution corrected - users are uploading their own images.')
+
+                    H, W, C = uov_input_image.shape
+                    image_is_super_large = H * W > 2800 * 2800
+
+                    if 'fast' in uov_method:
+                        direct_return = True
+                    elif image_is_super_large:
+                        print('Image is too large. Directly returned the SR image. '
+                              'Usually directly return SR image at 4K resolution '
+                              'yields better results than SDXL diffusion.')
+                        direct_return = True
+                    else:
+                        direct_return = False
+
+                    if direct_return:
+                        d = [('Upscale (Fast)', '2x')]
+                        log(uov_input_image, d, single_line_number=1, output_format=output_format)
+                        outputs.append(['results', [uov_input_image]])
+                        return
+
+                    tiled = True
+                    denoising_strength = 1.0 - 0.618
+                    steps = int(steps * 0.618)
+                    switch = int(steps * 0.67)
+                    initial_pixels = core.numpy_to_pytorch(uov_input_image)
+                    progressbar(0, 'VAE encoding ...')
+
+                    initial_latent = core.encode_vae(vae=pipeline.xl_base_patched.vae, pixels=initial_pixels, tiled=True)
+                    B, C, H, W = initial_latent['samples'].shape
+                    width = W * 8
+                    height = H * 8
+                    print(f'Final resolution is {str((height, width))}.')
+            if current_tab == 'inpaint' and isinstance(inpaint_input_image, dict):
+                sampler_name = 'dpmpp_fooocus_2m_sde_inpaint_seamless'
                 inpaint_image = inpaint_input_image['image']
                 inpaint_mask = inpaint_input_image['mask'][:, :, 0]
-
-                if inpaint_mask_upload_checkbox:
-                    if isinstance(inpaint_mask_image_upload, np.ndarray):
-                        if inpaint_mask_image_upload.ndim == 3:
-                            H, W, C = inpaint_image.shape
-                            inpaint_mask_image_upload = resample_image(inpaint_mask_image_upload, width=W, height=H)
-                            inpaint_mask_image_upload = np.mean(inpaint_mask_image_upload, axis=2)
-                            inpaint_mask_image_upload = (inpaint_mask_image_upload > 127).astype(np.uint8) * 255
-                            inpaint_mask = np.maximum(inpaint_mask, inpaint_mask_image_upload)
-
-                if int(inpaint_erode_or_dilate) != 0:
-                    inpaint_mask = erode_or_dilate(inpaint_mask, inpaint_erode_or_dilate)
-
-                if invert_mask_checkbox:
-                    inpaint_mask = 255 - inpaint_mask
-
-                inpaint_image = HWC3(inpaint_image)
                 if isinstance(inpaint_image, np.ndarray) and isinstance(inpaint_mask, np.ndarray) \
                         and (np.any(inpaint_mask > 127) or len(outpaint_selections) > 0):
-                    progressbar(async_task, 1, 'Downloading upscale models ...')
-                    modules.config.downloading_upscale_model()
-                    if inpaint_parameterized:
-                        progressbar(async_task, 1, 'Downloading inpainter ...')
-                        inpaint_head_model_path, inpaint_patch_model_path = modules.config.downloading_inpaint_models(
-                            inpaint_engine)
-                        base_model_additional_loras += [(inpaint_patch_model_path, 1.0)]
-                        print(f'[Inpaint] Current inpaint model is {inpaint_patch_model_path}')
-                        if refiner_model_name == 'None':
-                            use_synthetic_refiner = True
-                            refiner_switch = 0.8
-                    else:
-                        inpaint_head_model_path, inpaint_patch_model_path = None, None
-                        print(f'[Inpaint] Parameterized inpaint is disabled.')
-                    if inpaint_additional_prompt != '':
-                        if prompt == '':
-                            prompt = inpaint_additional_prompt
-                        else:
-                            prompt = inpaint_additional_prompt + '\n' + prompt
-                    goals.append('inpaint')
-            if current_tab == 'ip' or \
-                    mixing_image_prompt_and_vary_upscale or \
-                    mixing_image_prompt_and_inpaint:
-                goals.append('cn')
-                progressbar(async_task, 1, 'Downloading control models ...')
-                if len(cn_tasks[flags.cn_canny]) > 0:
-                    controlnet_canny_path = modules.config.downloading_controlnet_canny()
-                if len(cn_tasks[flags.cn_cpds]) > 0:
-                    controlnet_cpds_path = modules.config.downloading_controlnet_cpds()
-                if len(cn_tasks[flags.cn_ip]) > 0:
-                    clip_vision_path, ip_negative_path, ip_adapter_path = modules.config.downloading_ip_adapters('ip')
-                if len(cn_tasks[flags.cn_ip_face]) > 0:
-                    clip_vision_path, ip_negative_path, ip_adapter_face_path = modules.config.downloading_ip_adapters(
-                        'face')
-                progressbar(async_task, 1, 'Loading control models ...')
+                    if len(outpaint_selections) > 0:
+                        H, W, C = inpaint_image.shape
+                        if 'top' in outpaint_selections:
+                            inpaint_image = np.pad(inpaint_image, [[int(H * 0.3), 0], [0, 0], [0, 0]], mode='edge')
+                            inpaint_mask = np.pad(inpaint_mask, [[int(H * 0.3), 0], [0, 0]], mode='constant', constant_values=255)
+                        if 'bottom' in outpaint_selections:
+                            inpaint_image = np.pad(inpaint_image, [[0, int(H * 0.3)], [0, 0], [0, 0]], mode='edge')
+                            inpaint_mask = np.pad(inpaint_mask, [[0, int(H * 0.3)], [0, 0]], mode='constant', constant_values=255)
 
-        # Load or unload CNs
-        pipeline.refresh_controlnets([controlnet_canny_path, controlnet_cpds_path])
-        ip_adapter.load_ip_adapter(clip_vision_path, ip_negative_path, ip_adapter_path)
-        ip_adapter.load_ip_adapter(clip_vision_path, ip_negative_path, ip_adapter_face_path)
+                        H, W, C = inpaint_image.shape
+                        if 'left' in outpaint_selections:
+                            inpaint_image = np.pad(inpaint_image, [[0, 0], [int(H * 0.3), 0], [0, 0]], mode='edge')
+                            inpaint_mask = np.pad(inpaint_mask, [[0, 0], [int(H * 0.3), 0]], mode='constant', constant_values=255)
+                        if 'right' in outpaint_selections:
+                            inpaint_image = np.pad(inpaint_image, [[0, 0], [0, int(H * 0.3)], [0, 0]], mode='edge')
+                            inpaint_mask = np.pad(inpaint_mask, [[0, 0], [0, int(H * 0.3)]], mode='constant', constant_values=255)
 
-        if overwrite_step > 0:
-            steps = overwrite_step
+                        inpaint_image = np.ascontiguousarray(inpaint_image.copy())
+                        inpaint_mask = np.ascontiguousarray(inpaint_mask.copy())
 
-        switch = int(round(steps * refiner_switch))
+                    inpaint_worker.current_task = inpaint_worker.InpaintWorker(image=inpaint_image, mask=inpaint_mask,
+                                                                               is_outpaint=len(outpaint_selections) > 0)
 
-        if overwrite_switch > 0:
-            switch = overwrite_switch
+                    # print(f'Inpaint task: {str((height, width))}')
+                    # outputs.append(['results', inpaint_worker.current_task.visualize_mask_processing()])
+                    # return
 
-        if overwrite_width > 0:
-            width = overwrite_width
+                    progressbar(0, 'Downloading inpainter ...')
+                    inpaint_head_model_path, inpaint_patch_model_path = modules.path.downloading_inpaint_models()
+                    loras += [(inpaint_patch_model_path, 1.0)]
 
-        if overwrite_height > 0:
-            height = overwrite_height
+                    inpaint_pixels = core.numpy_to_pytorch(inpaint_worker.current_task.image_ready)
+                    progressbar(0, 'VAE encoding ...')
+                    initial_latent = core.encode_vae(vae=pipeline.xl_base_patched.vae, pixels=inpaint_pixels)
+                    inpaint_latent = initial_latent['samples']
+                    B, C, H, W = inpaint_latent.shape
+                    inpaint_mask = core.numpy_to_pytorch(inpaint_worker.current_task.mask_ready[None])
+                    inpaint_mask = torch.nn.functional.avg_pool2d(inpaint_mask, (8, 8))
+                    inpaint_mask = torch.nn.functional.interpolate(inpaint_mask, (H, W), mode='bilinear')
+                    inpaint_worker.current_task.load_latent(latent=inpaint_latent, mask=inpaint_mask)
 
-        print(f'[Parameters] Sampler = {sampler_name} - {scheduler_name}')
-        print(f'[Parameters] Steps = {steps} - {switch}')
+                    progressbar(0, 'VAE inpaint encoding ...')
 
-        progressbar(async_task, 1, 'Initializing ...')
+                    inpaint_mask = (inpaint_worker.current_task.mask_ready > 0).astype(np.float32)
+                    inpaint_mask = torch.tensor(inpaint_mask).float()
 
-        if not skip_prompt_processing:
+                    vae_dict = core.encode_vae_inpaint(
+                        mask=inpaint_mask, vae=pipeline.xl_base_patched.vae, pixels=inpaint_pixels)
 
-            prompts = remove_empty_str([safe_str(p) for p in prompt.splitlines()], default='')
-            negative_prompts = remove_empty_str([safe_str(p) for p in negative_prompt.splitlines()], default='')
+                    inpaint_latent = vae_dict['samples']
+                    inpaint_mask = vae_dict['noise_mask']
+                    inpaint_worker.current_task.load_inpaint_guidance(latent=inpaint_latent, mask=inpaint_mask, model_path=inpaint_head_model_path)
 
-            prompt = prompts[0]
-            negative_prompt = negative_prompts[0]
+                    B, C, H, W = inpaint_latent.shape
+                    height, width = inpaint_worker.current_task.image_raw.shape[:2]
+                    print(f'Final resolution is {str((height, width))}, latent is {str((H * 8, W * 8))}.')
 
-            if prompt == '':
-                # disable expansion when empty since it is not meaningful and influences image prompt
-                use_expansion = False
 
-            extra_positive_prompts = prompts[1:] if len(prompts) > 1 else []
-            extra_negative_prompts = negative_prompts[1:] if len(negative_prompts) > 1 else []
+        input_gallery_size = len(input_gallery)
+        if input_gallery_size == 0:
+            img2img_mode = False
+            input_image_path = None
+            control_lora_canny = False
+            control_lora_depth = False
 
-            progressbar(async_task, 2, 'Loading models ...')
+        revision_gallery_size = len(revision_gallery)
+        if revision_gallery_size == 0:
+            revision_mode = False
 
-            loras, prompt = parse_lora_references_from_prompt(prompt, loras, modules.config.default_max_lora_number)
-            loras += performance_loras
-            pipeline.refresh_everything(refiner_model_name=refiner_model_name, base_model_name=base_model_name,
-                                        loras=loras, base_model_additional_loras=base_model_additional_loras,
-                                        use_synthetic_refiner=use_synthetic_refiner, vae_name=vae_name)
 
-            pipeline.set_clip_skip(clip_skip)
+        progressbar(1, 'Initializing ...')
 
-            progressbar(async_task, 3, 'Processing prompts ...')
-            tasks = []
+        raw_prompt = prompt
+        raw_negative_prompt = negative_prompt
 
-            for i in range(image_number):
-                if disable_seed_increment:
-                    task_seed = seed % (constants.MAX_SEED + 1)
-                else:
-                    task_seed = (seed + i) % (constants.MAX_SEED + 1)  # randint is inclusive, % is not
+        prompts = remove_empty_str([safe_str(p) for p in prompt.split('\n')], default='')
+        negative_prompts = remove_empty_str([safe_str(p) for p in negative_prompt.split('\n')], default='')
 
-                task_rng = random.Random(task_seed)  # may bind to inpaint noise in the future
-                task_prompt = apply_wildcards(prompt, task_rng, i, read_wildcards_in_order)
-                task_prompt = apply_arrays(task_prompt, i)
-                task_negative_prompt = apply_wildcards(negative_prompt, task_rng, i, read_wildcards_in_order)
-                task_extra_positive_prompts = [apply_wildcards(pmt, task_rng, i, read_wildcards_in_order) for pmt in
-                                               extra_positive_prompts]
-                task_extra_negative_prompts = [apply_wildcards(pmt, task_rng, i, read_wildcards_in_order) for pmt in
-                                               extra_negative_prompts]
+        prompt = prompts[0]
+        negative_prompt = negative_prompts[0]
 
-                positive_basic_workloads = []
-                negative_basic_workloads = []
+        extra_positive_prompts = prompts[1:] if len(prompts) > 1 else []
+        extra_negative_prompts = negative_prompts[1:] if len(negative_prompts) > 1 else []
 
-                task_styles = style_selections.copy()
-                if use_style:
-                    for i, s in enumerate(task_styles):
-                        if s == random_style_name:
-                            s = get_random_style(task_rng)
-                            task_styles[i] = s
-                        p, n = apply_style(s, positive=task_prompt)
-                        positive_basic_workloads = positive_basic_workloads + p
-                        negative_basic_workloads = negative_basic_workloads + n
-                else:
-                    positive_basic_workloads.append(task_prompt)
+        try:
+            seed = int(image_seed) 
+        except Exception as e:
+            seed = -1
+        if not isinstance(seed, int) or seed < constants.MIN_SEED or seed > constants.MAX_SEED:
+            seed = random.randint(constants.MIN_SEED, constants.MAX_SEED)
 
-                negative_basic_workloads.append(task_negative_prompt)  # Always use independent workload for negative.
 
-                positive_basic_workloads = positive_basic_workloads + task_extra_positive_prompts
-                negative_basic_workloads = negative_basic_workloads + task_extra_negative_prompts
+        progressbar(3, 'Loading models ...')
+        pipeline.refresh_everything(
+            refiner_model_name=refiner_model_name,
+            base_model_name=base_model_name,
+            loras=loras,
+            freeu=freeu,
+            b1=freeu_b1,
+            b2=freeu_b2,
+            s1=freeu_s1,
+            s2=freeu_s2)
 
-                positive_basic_workloads = remove_empty_str(positive_basic_workloads, default=task_prompt)
-                negative_basic_workloads = remove_empty_str(negative_basic_workloads, default=task_negative_prompt)
+        is_sdxl = pipeline.is_base_sdxl()
+        if not is_sdxl:
+            print('WARNING: using non-SDXL base model (supported in limited scope).')
+            control_lora_canny = False
+            control_lora_depth = False
+            revision_mode = False
 
-                tasks.append(dict(
-                    task_seed=task_seed,
-                    task_prompt=task_prompt,
-                    task_negative_prompt=task_negative_prompt,
-                    positive=positive_basic_workloads,
-                    negative=negative_basic_workloads,
-                    expansion='',
-                    c=None,
-                    uc=None,
-                    positive_top_k=len(positive_basic_workloads),
-                    negative_top_k=len(negative_basic_workloads),
-                    log_positive_prompt='\n'.join([task_prompt] + task_extra_positive_prompts),
-                    log_negative_prompt='\n'.join([task_negative_prompt] + task_extra_negative_prompts),
-                    styles=task_styles
-                ))
+        pipeline.set_clip_skips(base_clip_skip, refiner_clip_skip)
+        if revision_mode:
+            pipeline.refresh_clip_vision()
+        if control_lora_canny:
+            pipeline.refresh_controlnet_canny(canny_model)
+        if control_lora_depth:
+            pipeline.refresh_controlnet_depth(depth_model)
 
-            if use_expansion:
-                for i, t in enumerate(tasks):
-                    progressbar(async_task, 4, f'Preparing Fooocus text #{i + 1} ...')
-                    expansion = pipeline.final_expansion(t['task_prompt'], t['task_seed'])
-                    print(f'[Prompt Expansion] {expansion}')
-                    t['expansion'] = expansion
-                    t['positive'] = copy.deepcopy(t['positive']) + [expansion]  # Deep copy.
+
+        clip_vision_outputs = []
+        if revision_mode:
+            revision_images_paths = list(map(lambda x: x['name'], revision_gallery))
+            revision_images_filenames = list(map(lambda path: os.path.basename(path), revision_images_paths))
+            revision_strengths = [revision_strength_1, revision_strength_2, revision_strength_3, revision_strength_4]
+            for i in range(revision_gallery_size):
+                progressbar(4, f'Revision for image {i + 1} ...')
+                print(f'Revision for image {i+1} started')
+                if revision_strengths[i % 4] != 0:
+                    revision_image = get_image(revision_images_paths[i])
+                    clip_vision_output = core.encode_clip_vision(pipeline.clip_vision, revision_image)
+                    clip_vision_outputs.append(clip_vision_output)
+                print(f'Revision for image {i+1} finished')
+        else:
+            revision_images_paths = []
+            revision_images_filenames = []
+            revision_strengths = []
+
+
+        progressbar(5, 'Processing prompts ...')
+        tasks = []
+        for i in range(image_number):
+            positive_basic_workloads = []
+            negative_basic_workloads = []
+            task_seed = seed if same_seed_for_all else seed + i
+            task_prompt = apply_wildcards(prompt, task_seed)
+
+            if use_style_iterator and i > 0: # original styles selection goes as 0th image
+                task_style_selections = style_selections + [style_iterator_pool[i - 1]]
+            else:
+                task_style_selections = style_selections
+
+            use_style = len(task_style_selections) > 0
+
+            if use_style:
+                for s in task_style_selections:
+                    p, n = apply_style(s, positive=task_prompt)
+                    positive_basic_workloads.append(p)
+                    negative_basic_workloads.append(n)
+            else:
+                positive_basic_workloads.append(task_prompt)
+    
+            negative_basic_workloads.append(negative_prompt)  # Always use independent workload for negative.
+
+            positive_basic_workloads = positive_basic_workloads + extra_positive_prompts
+            negative_basic_workloads = negative_basic_workloads + extra_negative_prompts
+
+            positive_basic_workloads = remove_empty_str(positive_basic_workloads, default=task_prompt)
+            negative_basic_workloads = remove_empty_str(negative_basic_workloads, default=negative_prompt)
+
+            tasks.append(dict(
+                task_seed=task_seed,
+                prompt=task_prompt,
+                style_selections=task_style_selections,
+                positive=positive_basic_workloads,
+                negative=negative_basic_workloads,
+                positive_top_k=len(positive_basic_workloads),
+                negative_top_k=len(negative_basic_workloads),
+                expansion='',
+                c=[None, None],
+                uc=[None, None]
+            ))
+
+
+        if use_expansion:
+            for i, t in enumerate(tasks):
+                progressbar(5, f'Preparing Fooocus text #{i + 1} ...')
+                expansion = pipeline.expansion(t['prompt'], t['task_seed'])
+                print(f'[Prompt Expansion] New suffix: {expansion}')
+                t['expansion'] = expansion
+                t['positive'] = copy.deepcopy(t['positive']) + [join_prompts(t['prompt'], expansion)]  # Deep copy.
+
+        for i, t in enumerate(tasks):
+            progressbar(7, f'Encoding base positive #{i + 1} ...')
+            t['c'][0] = pipeline.clip_encode(sd=pipeline.xl_base_patched, texts=t['positive'],
+                                             pool_top_k=t['positive_top_k'])
+
+        for i, t in enumerate(tasks):
+            progressbar(9, f'Encoding base negative #{i + 1} ...')
+            t['uc'][0] = pipeline.clip_encode(sd=pipeline.xl_base_patched, texts=t['negative'],
+                                              pool_top_k=t['negative_top_k'])
+
+        if pipeline.xl_refiner is not None:
+            virtual_memory.load_from_virtual_memory(pipeline.xl_refiner.clip.cond_stage_model)
 
             for i, t in enumerate(tasks):
-                progressbar(async_task, 5, f'Encoding positive #{i + 1} ...')
-                t['c'] = pipeline.clip_encode(texts=t['positive'], pool_top_k=t['positive_top_k'])
+                progressbar(11, f'Encoding refiner positive #{i + 1} ...')
+                t['c'][1] = pipeline.clip_encode(sd=pipeline.xl_refiner, texts=t['positive'],
+                                                 pool_top_k=t['positive_top_k'])
 
             for i, t in enumerate(tasks):
-                if abs(float(cfg_scale) - 1.0) < 1e-4:
-                    t['uc'] = pipeline.clone_cond(t['c'])
-                else:
-                    progressbar(async_task, 6, f'Encoding negative #{i + 1} ...')
-                    t['uc'] = pipeline.clip_encode(texts=t['negative'], pool_top_k=t['negative_top_k'])
+                progressbar(13, f'Encoding refiner negative #{i + 1} ...')
+                t['uc'][1] = pipeline.clip_encode(sd=pipeline.xl_refiner, texts=t['negative'],
+                                                  pool_top_k=t['negative_top_k'])
 
-        if len(goals) > 0:
-            progressbar(async_task, 7, 'Image processing ...')
+            virtual_memory.try_move_to_virtual_memory(pipeline.xl_refiner.clip.cond_stage_model)
 
-        if 'vary' in goals:
-            if 'subtle' in uov_method:
-                denoising_strength = 0.5
-            if 'strong' in uov_method:
-                denoising_strength = 0.85
-            if overwrite_vary_strength > 0:
-                denoising_strength = overwrite_vary_strength
 
-            shape_ceil = get_image_shape_ceil(uov_input_image)
-            if shape_ceil < 1024:
-                print(f'[Vary] Image is resized because it is too small.')
-                shape_ceil = 1024
-            elif shape_ceil > 2048:
-                print(f'[Vary] Image is resized because it is too big.')
-                shape_ceil = 2048
+        for i, t in enumerate(tasks):
+            progressbar(13, f'Applying prompt strengths #{i + 1} ...')
+            t['c'][0], t['c'][1] = pipeline.apply_prompt_strength(t['c'][0], t['c'][1], positive_prompt_strength)
+            t['uc'][0], t['uc'][1] = pipeline.apply_prompt_strength(t['uc'][0], t['uc'][1], negative_prompt_strength)
 
-            uov_input_image = set_image_shape_ceil(uov_input_image, shape_ceil)
+        for i, t in enumerate(tasks):
+            progressbar(13, f'Applying Revision #{i + 1} ...')
+            t['c'][0] = pipeline.apply_revision(t['c'][0], revision_mode, revision_strengths, clip_vision_outputs)
 
-            initial_pixels = core.numpy_to_pytorch(uov_input_image)
-            progressbar(async_task, 8, 'VAE encoding ...')
 
-            candidate_vae, _ = pipeline.get_candidate_vae(
-                steps=steps,
-                switch=switch,
-                denoise=denoising_strength,
-                refiner_swap_method=refiner_swap_method
-            )
+        pipeline.clear_all_caches()  # save memory
 
-            initial_latent = core.encode_vae(vae=candidate_vae, pixels=initial_pixels)
-            B, C, H, W = initial_latent['samples'].shape
-            width = W * 8
-            height = H * 8
-            print(f'Final resolution is {str((height, width))}.')
-
-        if 'upscale' in goals:
-            H, W, C = uov_input_image.shape
-            progressbar(async_task, 9, f'Upscaling image from {str((H, W))} ...')
-            uov_input_image = perform_upscale(uov_input_image)
-            print(f'Image upscaled.')
-
-            if '1.5x' in uov_method:
-                f = 1.5
-            elif '2x' in uov_method:
-                f = 2.0
-            else:
-                f = 1.0
-
-            shape_ceil = get_shape_ceil(H * f, W * f)
-
-            if shape_ceil < 1024:
-                print(f'[Upscale] Image is resized because it is too small.')
-                uov_input_image = set_image_shape_ceil(uov_input_image, 1024)
-                shape_ceil = 1024
-            else:
-                uov_input_image = resample_image(uov_input_image, width=W * f, height=H * f)
-
-            image_is_super_large = shape_ceil > 2800
-
-            if 'fast' in uov_method:
-                direct_return = True
-            elif image_is_super_large:
-                print('Image is too large. Directly returned the SR image. '
-                      'Usually directly return SR image at 4K resolution '
-                      'yields better results than SDXL diffusion.')
-                direct_return = True
-            else:
-                direct_return = False
-
-            if direct_return:
-                d = [('Upscale (Fast)', 'upscale_fast', '2x')]
-                if modules.config.default_black_out_nsfw or black_out_nsfw:
-                    progressbar(async_task, 100, 'Checking for NSFW content ...')
-                    uov_input_image = default_censor(uov_input_image)
-                progressbar(async_task, 100, 'Saving image to system ...')
-                uov_input_image_path = log(uov_input_image, d, output_format=output_format)
-                yield_result(async_task, uov_input_image_path, black_out_nsfw, False, do_not_show_finished_images=True)
-                return
-
-            tiled = True
-            denoising_strength = 0.382
-
-            if overwrite_upscale_strength > 0:
-                denoising_strength = overwrite_upscale_strength
-
-            initial_pixels = core.numpy_to_pytorch(uov_input_image)
-            progressbar(async_task, 10, 'VAE encoding ...')
-
-            candidate_vae, _ = pipeline.get_candidate_vae(
-                steps=steps,
-                switch=switch,
-                denoise=denoising_strength,
-                refiner_swap_method=refiner_swap_method
-            )
-
-            initial_latent = core.encode_vae(
-                vae=candidate_vae,
-                pixels=initial_pixels, tiled=True)
-            B, C, H, W = initial_latent['samples'].shape
-            width = W * 8
-            height = H * 8
-            print(f'Final resolution is {str((height, width))}.')
-
-        if 'inpaint' in goals:
-            if len(outpaint_selections) > 0:
-                H, W, C = inpaint_image.shape
-                if 'top' in outpaint_selections:
-                    inpaint_image = np.pad(inpaint_image, [[int(H * 0.3), 0], [0, 0], [0, 0]], mode='edge')
-                    inpaint_mask = np.pad(inpaint_mask, [[int(H * 0.3), 0], [0, 0]], mode='constant',
-                                          constant_values=255)
-                if 'bottom' in outpaint_selections:
-                    inpaint_image = np.pad(inpaint_image, [[0, int(H * 0.3)], [0, 0], [0, 0]], mode='edge')
-                    inpaint_mask = np.pad(inpaint_mask, [[0, int(H * 0.3)], [0, 0]], mode='constant',
-                                          constant_values=255)
-
-                H, W, C = inpaint_image.shape
-                if 'left' in outpaint_selections:
-                    inpaint_image = np.pad(inpaint_image, [[0, 0], [int(W * 0.3), 0], [0, 0]], mode='edge')
-                    inpaint_mask = np.pad(inpaint_mask, [[0, 0], [int(W * 0.3), 0]], mode='constant',
-                                          constant_values=255)
-                if 'right' in outpaint_selections:
-                    inpaint_image = np.pad(inpaint_image, [[0, 0], [0, int(W * 0.3)], [0, 0]], mode='edge')
-                    inpaint_mask = np.pad(inpaint_mask, [[0, 0], [0, int(W * 0.3)]], mode='constant',
-                                          constant_values=255)
-
-                inpaint_image = np.ascontiguousarray(inpaint_image.copy())
-                inpaint_mask = np.ascontiguousarray(inpaint_mask.copy())
-                inpaint_strength = 1.0
-                inpaint_respective_field = 1.0
-
-            denoising_strength = inpaint_strength
-
-            inpaint_worker.current_task = inpaint_worker.InpaintWorker(
-                image=inpaint_image,
-                mask=inpaint_mask,
-                use_fill=denoising_strength > 0.99,
-                k=inpaint_respective_field
-            )
-
-            if debugging_inpaint_preprocessor:
-                yield_result(async_task, inpaint_worker.current_task.visualize_mask_processing(), black_out_nsfw,
-                             do_not_show_finished_images=True)
-                return
-
-            progressbar(async_task, 11, 'VAE Inpaint encoding ...')
-
-            inpaint_pixel_fill = core.numpy_to_pytorch(inpaint_worker.current_task.interested_fill)
-            inpaint_pixel_image = core.numpy_to_pytorch(inpaint_worker.current_task.interested_image)
-            inpaint_pixel_mask = core.numpy_to_pytorch(inpaint_worker.current_task.interested_mask)
-
-            candidate_vae, candidate_vae_swap = pipeline.get_candidate_vae(
-                steps=steps,
-                switch=switch,
-                denoise=denoising_strength,
-                refiner_swap_method=refiner_swap_method
-            )
-
-            latent_inpaint, latent_mask = core.encode_vae_inpaint(
-                mask=inpaint_pixel_mask,
-                vae=candidate_vae,
-                pixels=inpaint_pixel_image)
-
-            latent_swap = None
-            if candidate_vae_swap is not None:
-                progressbar(async_task, 12, 'VAE SD15 encoding ...')
-                latent_swap = core.encode_vae(
-                    vae=candidate_vae_swap,
-                    pixels=inpaint_pixel_fill)['samples']
-
-            progressbar(async_task, 13, 'VAE encoding ...')
-            latent_fill = core.encode_vae(
-                vae=candidate_vae,
-                pixels=inpaint_pixel_fill)['samples']
-
-            inpaint_worker.current_task.load_latent(
-                latent_fill=latent_fill, latent_mask=latent_mask, latent_swap=latent_swap)
-
-            if inpaint_parameterized:
-                pipeline.final_unet = inpaint_worker.current_task.patch(
-                    inpaint_head_model_path=inpaint_head_model_path,
-                    inpaint_latent=latent_inpaint,
-                    inpaint_latent_mask=latent_mask,
-                    model=pipeline.final_unet
-                )
-
-            if not inpaint_disable_initial_latent:
-                initial_latent = {'samples': latent_fill}
-
-            B, C, H, W = latent_fill.shape
-            height, width = H * 8, W * 8
-            final_height, final_width = inpaint_worker.current_task.image.shape[:2]
-            print(f'Final resolution is {str((final_height, final_width))}, latent is {str((height, width))}.')
-
-        if 'cn' in goals:
-            for task in cn_tasks[flags.cn_canny]:
-                cn_img, cn_stop, cn_weight = task
-                cn_img = resize_image(HWC3(cn_img), width=width, height=height)
-
-                if not skipping_cn_preprocessor:
-                    cn_img = preprocessors.canny_pyramid(cn_img, canny_low_threshold, canny_high_threshold)
-
-                cn_img = HWC3(cn_img)
-                task[0] = core.numpy_to_pytorch(cn_img)
-                if debugging_cn_preprocessor:
-                    yield_result(async_task, cn_img, black_out_nsfw, do_not_show_finished_images=True)
-                    return
-            for task in cn_tasks[flags.cn_cpds]:
-                cn_img, cn_stop, cn_weight = task
-                cn_img = resize_image(HWC3(cn_img), width=width, height=height)
-
-                if not skipping_cn_preprocessor:
-                    cn_img = preprocessors.cpds(cn_img)
-
-                cn_img = HWC3(cn_img)
-                task[0] = core.numpy_to_pytorch(cn_img)
-                if debugging_cn_preprocessor:
-                    yield_result(async_task, cn_img, black_out_nsfw, do_not_show_finished_images=True)
-                    return
-            for task in cn_tasks[flags.cn_ip]:
-                cn_img, cn_stop, cn_weight = task
-                cn_img = HWC3(cn_img)
-
-                # https://github.com/tencent-ailab/IP-Adapter/blob/d580c50a291566bbf9fc7ac0f760506607297e6d/README.md?plain=1#L75
-                cn_img = resize_image(cn_img, width=224, height=224, resize_mode=0)
-
-                task[0] = ip_adapter.preprocess(cn_img, ip_adapter_path=ip_adapter_path)
-                if debugging_cn_preprocessor:
-                    yield_result(async_task, cn_img, black_out_nsfw, do_not_show_finished_images=True)
-                    return
-            for task in cn_tasks[flags.cn_ip_face]:
-                cn_img, cn_stop, cn_weight = task
-                cn_img = HWC3(cn_img)
-
-                if not skipping_cn_preprocessor:
-                    cn_img = extras.face_crop.crop_image(cn_img)
-
-                # https://github.com/tencent-ailab/IP-Adapter/blob/d580c50a291566bbf9fc7ac0f760506607297e6d/README.md?plain=1#L75
-                cn_img = resize_image(cn_img, width=224, height=224, resize_mode=0)
-
-                task[0] = ip_adapter.preprocess(cn_img, ip_adapter_path=ip_adapter_face_path)
-                if debugging_cn_preprocessor:
-                    yield_result(async_task, cn_img, black_out_nsfw, do_not_show_finished_images=True)
-                    return
-
-            all_ip_tasks = cn_tasks[flags.cn_ip] + cn_tasks[flags.cn_ip_face]
-
-            if len(all_ip_tasks) > 0:
-                pipeline.final_unet = ip_adapter.patch_model(pipeline.final_unet, all_ip_tasks)
-
-        if freeu_enabled:
-            print(f'FreeU is enabled!')
-            pipeline.final_unet = core.apply_freeu(
-                pipeline.final_unet,
-                freeu_b1,
-                freeu_b2,
-                freeu_s1,
-                freeu_s2
-            )
-
+        results = []
+        metadata_strings = []
         all_steps = steps * image_number
 
-        print(f'[Parameters] Denoising Strength = {denoising_strength}')
-
-        if isinstance(initial_latent, dict) and 'samples' in initial_latent:
-            log_shape = initial_latent['samples'].shape
-        else:
-            log_shape = f'Image Space {(height, width)}'
-
-        print(f'[Parameters] Initial Latent shape: {log_shape}')
-
-        preparation_time = time.perf_counter() - execution_start_time
-        print(f'Preparation time: {preparation_time:.2f} seconds')
-
-        final_sampler_name = sampler_name
-        final_scheduler_name = scheduler_name
-
-        if scheduler_name in ['lcm', 'tcd']:
-            final_scheduler_name = 'sgm_uniform'
-            if pipeline.final_unet is not None:
-                pipeline.final_unet = core.opModelSamplingDiscrete.patch(
-                    pipeline.final_unet,
-                    sampling=scheduler_name,
-                    zsnr=False)[0]
-            if pipeline.final_refiner_unet is not None:
-                pipeline.final_refiner_unet = core.opModelSamplingDiscrete.patch(
-                    pipeline.final_refiner_unet,
-                    sampling=scheduler_name,
-                    zsnr=False)[0]
-            print(f'Using {scheduler_name} scheduler.')
-
-        async_task.yields.append(['preview', (flags.preparation_step_count, 'Moving model to GPU ...', None)])
-
         def callback(step, x0, x, total_steps, y):
-            done_steps = current_task_id * steps + step
-            async_task.yields.append(['preview', (
-                int(flags.preparation_step_count + (100 - flags.preparation_step_count) * float(done_steps) / float(all_steps)),
-                f'Sampling step {step + 1}/{total_steps}, image {current_task_id + 1}/{image_number} ...', y)])
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            done_steps = current_task_idx * steps + step
+            outputs.append(['preview', (
+                int(15.0 + 85.0 * float(done_steps) / float(all_steps)),
+                f'Step {step}/{total_steps} in the {current_task_idx + 1}-th Sampling',
+                y)])
 
-        for current_task_id, task in enumerate(tasks):
-            current_progress = int(flags.preparation_step_count + (100 - flags.preparation_step_count) * float(current_task_id * steps) / float(all_steps))
-            progressbar(async_task, current_progress, f'Preparing task {current_task_id + 1}/{image_number} ...')
-            execution_start_time = time.perf_counter()
+        print(f'[ADM] Negative ADM = {modules.patch.negative_adm}')
+
+        outputs.append(['preview', (13, 'Starting tasks ...', None)])
+        for current_task_idx, task in enumerate(tasks):
+            if img2img_mode or control_lora_canny or control_lora_depth:
+                input_gallery_entry = input_gallery[current_task_idx % input_gallery_size]
+                input_image_path = input_gallery_entry['name']
+                input_image_filename = None if input_image_path == None else os.path.basename(input_image_path)
+            else:
+                input_image_path = None
+                input_image_filename = None
+                keep_input_names = None
+
+            if img2img_mode:
+                start_step = round(steps * img2img_start_step)
+                denoise = img2img_denoise
+            else:
+                start_step = 0
+                denoise = denoising_strength
+
+            input_image = None
+            if input_image_path != None:
+                img2img_megapixels = width * height * img2img_scale ** 2 / 2**20
+                min_mp = constants.MIN_MEGAPIXELS if is_sdxl else constants.MIN_MEGAPIXELS_SD
+                max_mp = constants.MAX_MEGAPIXELS if is_sdxl else constants.MAX_MEGAPIXELS_SD
+                if img2img_megapixels < min_mp:
+                    img2img_megapixels = min_mp
+                elif img2img_megapixels > max_mp:
+                    img2img_megapixels = max_mp
+                input_image = get_image(input_image_path, img2img_megapixels)
 
             try:
-                if async_task.last_stop is not False:
-                    ldm_patched.modules.model_management.interrupt_current_processing()
-                positive_cond, negative_cond = task['c'], task['uc']
-
-                if 'cn' in goals:
-                    for cn_flag, cn_path in [
-                        (flags.cn_canny, controlnet_canny_path),
-                        (flags.cn_cpds, controlnet_cpds_path)
-                    ]:
-                        for cn_img, cn_stop, cn_weight in cn_tasks[cn_flag]:
-                            positive_cond, negative_cond = core.apply_controlnet(
-                                positive_cond, negative_cond,
-                                pipeline.loaded_ControlNets[cn_path], cn_img, cn_weight, 0, cn_stop)
+                execution_start_time = time.perf_counter()
 
                 imgs = pipeline.process_diffusion(
-                    positive_cond=positive_cond,
-                    negative_cond=negative_cond,
+                    positive_cond=task['c'],
+                    negative_cond=task['uc'],
                     steps=steps,
                     switch=switch,
                     width=width,
                     height=height,
                     image_seed=task['task_seed'],
+                    sampler_name=sampler_name,
+                    scheduler=scheduler,
+                    cfg=cfg,
+                    img2img=img2img_mode, #? -> latent
+                    input_image=input_image, #? -> latent
+                    start_step=start_step,
+                    control_lora_canny=control_lora_canny,
+                    canny_edge_low=canny_edge_low,
+                    canny_edge_high=canny_edge_high,
+                    canny_start=canny_start,
+                    canny_stop=canny_stop,
+                    canny_strength=canny_strength,
+                    control_lora_depth=control_lora_depth,
+                    depth_start=depth_start,
+                    depth_stop=depth_stop,
+                    depth_strength=depth_strength,
                     callback=callback,
-                    sampler_name=final_sampler_name,
-                    scheduler_name=final_scheduler_name,
                     latent=initial_latent,
-                    denoise=denoising_strength,
-                    tiled=tiled,
-                    cfg_scale=cfg_scale,
-                    refiner_swap_method=refiner_swap_method,
-                    disable_preview=disable_preview
-                )
-
-                del task['c'], task['uc'], positive_cond, negative_cond  # Save memory
+                    denoise=denoise,
+                    tiled=tiled)
 
                 if inpaint_worker.current_task is not None:
                     imgs = [inpaint_worker.current_task.post_process(x) for x in imgs]
 
-                img_paths = []
-                current_progress = int(flags.preparation_step_count + (100 - flags.preparation_step_count) * float((current_task_id + 1) * steps) / float(all_steps))
-                if modules.config.default_black_out_nsfw or black_out_nsfw:
-                    progressbar(async_task, current_progress, 'Checking for NSFW content ...')
-                    imgs = default_censor(imgs)
-
-                progressbar(async_task, current_progress, f'Saving image {current_task_id + 1}/{image_number} to system ...')
+                execution_time = time.perf_counter() - execution_start_time
+                print(f'Diffusion time: {execution_time:.2f} seconds')
+    
+                metadata = {
+                    'prompt': raw_prompt, 'negative_prompt': raw_negative_prompt, 'styles': task['style_selections'],
+                    'real_prompt': task['positive'], 'real_negative_prompt': task['negative'],
+                    'seed': task['task_seed'], 'width': width, 'height': height,
+                    'sampler': sampler_name, 'scheduler': scheduler, 'performance': performance,
+                    'steps': steps, 'switch': switch, 'sharpness': sharpness, 'cfg': cfg,
+                    'base_clip_skip': base_clip_skip, 'refiner_clip_skip': refiner_clip_skip,
+                    'base_model': base_model_name, 'refiner_model': refiner_model_name,
+                    'l1': l1, 'w1': w1, 'l2': l2, 'w2': w2, 'l3': l3, 'w3': w3,
+                    'l4': l4, 'w4': w4, 'l5': l5, 'w5': w5, 'freeu': freeu,
+                    'img2img': img2img_mode, 'revision': revision_mode,
+                    'positive_prompt_strength': positive_prompt_strength, 'negative_prompt_strength': negative_prompt_strength,
+                    'control_lora_canny': control_lora_canny, 'control_lora_depth': control_lora_depth,
+                    'prompt_expansion': use_expansion
+                }
+                if freeu:
+                    metadata |= {
+                        'freeu_b1': freeu_b1, 'freeu_b2': freeu_b2, 'freeu_s1': freeu_s1, 'freeu_s2': freeu_s2
+                    }
+                if img2img_mode:
+                    metadata |= {
+                        'start_step': start_step, 'denoise': denoise, 'scale': img2img_scale, 'input_image': input_image_filename
+                    }
+                if revision_mode:
+                    metadata |= {
+                        'revision_strength_1': revision_strength_1, 'revision_strength_2': revision_strength_2,
+                        'revision_strength_3': revision_strength_3, 'revision_strength_4': revision_strength_4,
+                        'revision_images': revision_images_filenames
+                    }
+                if control_lora_canny:
+                    metadata |= {
+                        'canny_edge_low': canny_edge_low, 'canny_edge_high': canny_edge_high, 'canny_start': canny_start,
+                        'canny_stop': canny_stop, 'canny_strength': canny_strength, 'canny_model': canny_model, 'canny_input': input_image_filename
+                    }
+                if control_lora_depth:
+                    metadata |= {
+                        'depth_start': depth_start, 'depth_stop': depth_stop, 'depth_strength': depth_strength, 'depth_model': depth_model, 'depth_input': input_image_filename
+                    }
+                metadata |= { 'software': fooocus_version.full_version }
+    
+                metadata_string = json.dumps(metadata, ensure_ascii=False)
+                metadata_strings.append(metadata_string)
+    
                 for x in imgs:
-                    d = [('Prompt', 'prompt', task['log_positive_prompt']),
-                         ('Negative Prompt', 'negative_prompt', task['log_negative_prompt']),
-                         ('Fooocus V2 Expansion', 'prompt_expansion', task['expansion']),
-                         ('Styles', 'styles',
-                          str(task['styles'] if not use_expansion else [fooocus_expansion] + task['styles'])),
-                         ('Performance', 'performance', performance_selection.value)]
-
-                    if performance_selection.steps() != steps:
-                        d.append(('Steps', 'steps', steps))
-
-                    d += [('Resolution', 'resolution', str((width, height))),
-                          ('Guidance Scale', 'guidance_scale', guidance_scale),
-                          ('Sharpness', 'sharpness', sharpness),
-                          ('ADM Guidance', 'adm_guidance', str((
-                              modules.patch.patch_settings[pid].positive_adm_scale,
-                              modules.patch.patch_settings[pid].negative_adm_scale,
-                              modules.patch.patch_settings[pid].adm_scaler_end))),
-                          ('Base Model', 'base_model', base_model_name),
-                          ('Refiner Model', 'refiner_model', refiner_model_name),
-                          ('Refiner Switch', 'refiner_switch', refiner_switch)]
-
-                    if refiner_model_name != 'None':
-                        if overwrite_switch > 0:
-                            d.append(('Overwrite Switch', 'overwrite_switch', overwrite_switch))
-                        if refiner_swap_method != flags.refiner_swap_method:
-                            d.append(('Refiner Swap Method', 'refiner_swap_method', refiner_swap_method))
-                    if modules.patch.patch_settings[pid].adaptive_cfg != modules.config.default_cfg_tsnr:
-                        d.append(
-                            ('CFG Mimicking from TSNR', 'adaptive_cfg', modules.patch.patch_settings[pid].adaptive_cfg))
-
-                    if clip_skip > 1:
-                        d.append(('CLIP Skip', 'clip_skip', clip_skip))
-                    d.append(('Sampler', 'sampler', sampler_name))
-                    d.append(('Scheduler', 'scheduler', scheduler_name))
-                    d.append(('VAE', 'vae', vae_name))
-                    d.append(('Seed', 'seed', str(task['task_seed'])))
-
-                    if freeu_enabled:
-                        d.append(('FreeU', 'freeu', str((freeu_b1, freeu_b2, freeu_s1, freeu_s2))))
-
-                    for li, (n, w) in enumerate(loras):
+                    d = [
+                        ('Prompt', raw_prompt),
+                        ('Negative Prompt', raw_negative_prompt),
+                        ('Fooocus V2 (Prompt Expansion)', task['expansion']),
+                        ('Styles', str(task['style_selections'])),
+                        ('Real Prompt', task['positive']),
+                        ('Real Negative Prompt', task['negative']),
+                        ('Seed', task['task_seed']),
+                        ('Resolution', get_resolution_string(width, height)),
+                        ('Performance', (performance, steps, switch)),
+                        ('Sampler & Scheduler', (sampler_name, scheduler)),
+                        ('Sharpness', sharpness),
+                        ('CFG & CLIP Skips', (cfg, base_clip_skip, refiner_clip_skip)),
+                        ('Base Model', base_model_name),
+                        ('Refiner Model', refiner_model_name),
+                        ('FreeU', (freeu, freeu_b1, freeu_b2, freeu_s1, freeu_s2) if freeu else (freeu)),
+                        ('Image-2-Image', (img2img_mode, start_step, denoise, img2img_scale, input_image_filename) if img2img_mode else (img2img_mode)),
+                        ('Revision', (revision_mode, revision_strength_1, revision_strength_2, revision_strength_3,
+                            revision_strength_4, revision_images_filenames) if revision_mode else (revision_mode)),
+                        ('Prompt Strengths', (positive_prompt_strength, negative_prompt_strength)),
+                        ('Canny', (control_lora_canny, canny_edge_low, canny_edge_high, canny_start, canny_stop,
+                            canny_strength, canny_model, input_image_filename) if control_lora_canny else (control_lora_canny)),
+                        ('Depth', (control_lora_depth, depth_start, depth_stop, depth_strength, depth_model, input_image_filename) if control_lora_depth else (control_lora_depth))
+                    ]
+                    for n, w in loras:
                         if n != 'None':
-                            d.append((f'LoRA {li + 1}', f'lora_combined_{li + 1}', f'{n} : {w}'))
+                            d.append((f'LoRA [{n}] weight', w))
+                    d.append(('Software', fooocus_version.full_version))
+                    d.append(('Execution Time', f'{execution_time:.2f} seconds'))
+                    log(x, d, 3, metadata_string, save_metadata_json, save_metadata_image, keep_input_names, input_image_filename, output_format)
 
-                    metadata_parser = None
-                    if save_metadata_to_images:
-                        metadata_parser = modules.meta_parser.get_metadata_parser(metadata_scheme)
-                        metadata_parser.set_data(task['log_positive_prompt'], task['positive'],
-                                                 task['log_negative_prompt'], task['negative'],
-                                                 steps, base_model_name, refiner_model_name, loras, vae_name)
-                    d.append(('Metadata Scheme', 'metadata_scheme',
-                              metadata_scheme.value if save_metadata_to_images else save_metadata_to_images))
-                    d.append(('Version', 'version', 'Fooocus v' + fooocus_version.version))
-                    img_paths.append(log(x, d, metadata_parser, output_format, task))
+                results += imgs
+            except comfy.model_management.InterruptProcessingException as e:
+                print('User stopped')
+                break
 
-                yield_result(async_task, img_paths, black_out_nsfw, False,
-                             do_not_show_finished_images=len(tasks) == 1 or disable_intermediate_results)
-            except ldm_patched.modules.model_management.InterruptProcessingException as e:
-                if async_task.last_stop == 'skip':
-                    print('User skipped')
-                    async_task.last_stop = False
-                    continue
-                else:
-                    print('User stopped')
-                    break
+        outputs.append(['metadatas', metadata_strings])
+        outputs.append(['results', results])
 
-            execution_time = time.perf_counter() - execution_start_time
-            print(f'Generating and saving time: {execution_time:.2f} seconds')
-        async_task.processing = False
+        pipeline.clear_all_caches() # cleanup after generation
+
         return
 
     while True:
         time.sleep(0.01)
-        if len(async_tasks) > 0:
-            task = async_tasks.pop(0)
-            generate_image_grid = task.args.pop(0)
-
-            try:
-                handler(task)
-                if generate_image_grid:
-                    build_image_wall(task)
-                task.yields.append(['finish', task.results])
-                pipeline.prepare_text_encoder(async_call=True)
-            except:
-                traceback.print_exc()
-                task.yields.append(['finish', task.results])
-            finally:
-                if pid in modules.patch.patch_settings:
-                    del modules.patch.patch_settings[pid]
+        if len(buffer) > 0:
+            task = buffer.pop(0)
+            handler(task)
     pass
 
 
