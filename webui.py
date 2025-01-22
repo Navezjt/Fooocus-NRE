@@ -381,7 +381,7 @@ with shared.gradio_root:
             with gr.Tab(label='Settings'):
                 performance = gr.Radio(label='Performance', choices=['Speed', 'Quality', 'Custom'], value=settings['performance'])
                 with gr.Row(visible=settings['performance'] == 'Custom') as custom_row:
-                    custom_steps = gr.Slider(label='Custom Steps', minimum=10, maximum=200, step=1, value=settings['custom_steps'])
+                    custom_steps = gr.Slider(label='Custom Steps', minimum=1, maximum=200, step=1, value=settings['custom_steps'])
                     custom_switch = gr.Slider(label='Custom Switch', minimum=0.2, maximum=1.0, step=0.01, value=settings['custom_switch'])
                 resolution = gr.Dropdown(label='Resolution (width × height)', choices=list(resolutions.keys()), value=settings['resolution'], allow_custom_value=True)
                 style_selections = gr.Dropdown(label='Image Style(s)', choices=style_keys, value=settings['styles'], multiselect=True, max_choices=8)
@@ -551,7 +551,7 @@ with shared.gradio_root:
                 depth_ctrls = [control_lora_depth, depth_start, depth_stop, depth_strength, depth_model]
 
             with gr.Tab(label='Sampling'):
-                cfg = gr.Slider(label='CFG', minimum=1.0, maximum=20.0, step=0.1, value=settings['cfg'])
+                cfg = gr.Slider(label='CFG', minimum=0.0, maximum=20.0, step=0.1, value=settings['cfg'])
                 base_clip_skip = gr.Slider(label='Base CLIP Skip', minimum=-10, maximum=-1, step=1, value=settings['base_clip_skip'])
                 refiner_clip_skip = gr.Slider(label='Refiner CLIP Skip', minimum=-10, maximum=-1, step=1, value=settings['refiner_clip_skip'])
                 sampler_name = gr.Dropdown(label='Sampler', choices=['dpmpp_2m_sde_gpu', 'dpmpp_2m_sde', 'dpmpp_3m_sde_gpu', 'dpmpp_3m_sde',
